@@ -1,0 +1,56 @@
+#------------------------------------#
+#-------------Переменные-------------#
+#------------------------------------#
+$Disable_Days = 30;
+$Delete_Days = 60;
+$file_logs = "Path\logs.txt";
+
+#перечень OU, в которых проверяем объекты
+$OU = @(
+'OU=Workstation1,DC=domain,DC=ru',
+'OU=Workstation2,DC=domain,DC=ru',
+'OU=Workstation3,DC=domain,DC=ru'
+)
+
+#------------------------------------#
+#------------Тело скрипта------------#
+#------------------------------------#
+
+#проверяем компьютеры, неактивные более 30 дней
+foreach ($current_OU in $OU) {
+    $time_disable = (Get-Date).Adddays(-($Disable_Days))
+
+    #выбираем из каждой OU включенные компы, неактивные более 30 дней
+    $disable_array = Get-ADComputer -Filter {(LastLogonTimeStamp -lt $time_disable) -and (Enabled -eq $True)} -SearchBase $current_OU -Properties lastLogonTimestamp | Select-Object name, @{N="Date";E= {[datetime]::FromFileTime($_."lastLogonTimestamp")}}
+        #проводим операцию с каждым компьютером
+        foreach ($pc in $disable_array) {
+                        $pc_name = $pc.name; $last_login = $pc.Date
+                        Get-ADComputer -Identity $pc_name | Disable-ADAccount #отключаем
+                        Add-Content -Path $file_logs -Value "$(Get-Date) Компьютер $pc_name отключен" #пишем лог
+                        }
+} 
+
+#пауза, чтобы информация о новом статусе компов синхронизировалась
+Start-Sleep 30
+
+#проверяем компьютеры, неактивные более 60 дней
+foreach ($current_OU in $OU) {
+    $time_delete = (Get-Date).Adddays(-($Delete_Days))
+
+    #выбиараем из каждой OU отключенные компы, неактивные более 60 дней
+    $delete_array = Get-ADComputer -Filter {(LastLogonTimeStamp -lt $time_delete) -and (Enabled -eq $False)} -SearchBase $current_OU -Properties lastLogonTimestamp | Select-Object name, @{N="Date";E={[datetime]::FromFileTime($_."lastLogonTimestamp")}}
+        #проводим операцию с каждым компьютером
+        foreach ($pc in $delete_array) {
+           $pc_name = $pc.name; $last_login = $pc.Date
+           $description = (Get-ADComputer -Identity $pc_name -Properties description).description #смотрим описание компа
+                        
+           try {Remove-ADComputer -Identity $pc_name -Confirm:$False -ErrorAction Stop #удаляем и пишем лог
+           Add-Content -Path $file_logs -Value "$(Get-Date) Компьютер $pc_name удален, последняя дата активности: $last_login, описание: $description" }
+                Catch {Add-Content -Path $file_logs -Value "$(Get-Date) Не удалось удалить компьютер $pc_name"}
+                        }
+} 
+
+#------------------------------------#
+#------------Логирование-------------#
+#------------------------------------#
+if (!$error) {Write-Host "В результате выполнения скрипта - ошибок не было" -foregroundcolor Yellow} else {Add-Content -Path $file_logs -Value "$(Get-Date) В результате выполнения скрипта были ошибки: $error"}
