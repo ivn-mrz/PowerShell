@@ -1,0 +1,112 @@
+#функция для отправки письма на ИТ и ИБ
+function Send_Mail_Ticket
+
+{param (
+[parameter(Mandatory=$true)]$TS,
+[parameter(Mandatory=$true)]$IP
+)
+
+#текст письма в html-формате. сгенерирован через https://mainspy.ru/visual_editor
+$body_mail = @"
+<p><span style="font-family:Times New Roman,Times,serif"><span style="font-size:14px">Запущен процесс вывода из эксплуатации терминального сервера <strong>$TS_name</strong> по процессу:<br />
+https://wiki.domain.ru/pages/URL</span></span></p>
+
+<p><span style="font-family:Times New Roman,Times,serif"><span style="font-size:14px">IP-адрес терминального сервера: <strong>$IP</strong></span></span></p>
+
+<p><span style="font-family:Times New Roman,Times,serif"><span style="font-size:14px">Что было сделано:</span></span></p>
+
+<ol>
+	<li><span style="font-family:Times New Roman,Times,serif"><span style="font-size:14px">Остановка ВМ</span></span></li>
+	<li><span style="font-family:Times New Roman,Times,serif"><span style="font-size:14px">Удаление ВМ</span></span></li>
+	<li><span style="font-family:Times New Roman,Times,serif"><span style="font-size:14px">Удаление терминального сервера из AD</span></span></li>
+	<li><span style="font-family:Times New Roman,Times,serif"><span style="font-size:14px">Удаление DNS-записи</span></span></li>
+</ol>
+
+<p><span style="font-family:Times New Roman,Times,serif"><span style="font-size:14px">Ошибки, возникшие в процессе выполнения: $error</span></span></p>
+
+<p> </p>
+
+<p><span style="font-family:Times New Roman,Times,serif"><span style="font-size:14px">===============================================</span></span></p>
+
+<p><span style="font-family:Times New Roman,Times,serif"><span style="font-size:14px">Что нужно сделать дополнительно:</span></span></p>
+
+<ol>
+	<li><span style="font-family:Times New Roman,Times,serif"><span style="font-size:14px">Удалить терминальный сервер из Zabbix </span></span></li>
+	<li><span style="font-family:Times New Roman,Times,serif"><span style="font-size:14px">Удалить правила фаервола на EDGE - роутерах </span></span></li>
+	<li><span style="font-family:Times New Roman,Times,serif"><span style="font-size:14px">Удалить машину из консоли KES</span></span></li>
+</ol>
+
+"@
+
+
+#отправка писем
+Send-MailMessage -From $($Settings.Mail.Automation) -To @($($Settings.Mail.Infosec),$($Settings.Mail.Helpdesk)) -Subject "Вывод из эксплуатации - терминальный сервер $TS" -Body $body_mail –SmtpServer $($Settings.Mail.SMTP_Server) -Encoding 'UTF8' -Port 587 –UseSsl -Credential $cred_mail -BodyAsHtml -Priority 'High'
+
+}
+
+#-----------------------------------------------#
+#                  Переменные                   #
+#-----------------------------------------------#
+
+#импорт данных из файла с настройками
+try {$Settings = Import-PowerShellDataFile "C:\Path\Settings3.psd1" -ErrorAction Stop}
+catch {throw "Не удалось получения переменных из файла данных. Остановка скрипта"}
+
+$cred_mail = Get-Secret -Name 'Secret' -Vault 'Vault3'
+
+#-----------------------------------------------#
+#                     START                     #
+#-----------------------------------------------#
+
+#собираем в массив имена всех групп безопасности, через которые клиенты получают доступ к ТС
+$All_RDP_Group = (Get-ADGroup -SearchBase $($Settings.OU.RDP_Groups) -Filter *).name
+
+Foreach ($Group in $All_RDP_Group) {
+
+    $All_Group_Member = Get-ADGroupMember -Identity $Group
+
+        if ($All_Group_Member -eq $null) {
+            
+            #подключаемся к vSphere
+            try {Connect-VIServer $($Settings.vSphere.URL_Connect)} catch {throw "Не удалось подключиться к vSphere. Остановка скрипта"}
+
+            #определяем название сервера
+            $TS_name = (Get-ADGroup -Identity $Group -Properties Description).Description
+            $IP_TS = (Get-VM $TS_name).Guest.IPAddress
+            Write-Host "Группа $Group пустая - терминальный сервер $TS_name больше не нужен. Начинаем вывод из эксплуатации"
+            if ($TS_name -eq $null) {Add-Content -Path $($Settings.Logs.Delete_TS) -Value "$(Get-Date) Должен удаляться сервер группы $Group, но его не существует"}
+            else {
+
+                #определяем текущий DC и зону
+                $DC = (Get-ADDomainController -Discover).name
+                $DNS_zone = (Get-ADDomainController -Discover).Domain
+
+                #остановка ВМ
+                try {Stop-VM -VM $TS_name -Confirm:$false -ErrorAction Stop; Add-Content -Path $($Settings.Logs.Delete_TS) -Value "$(Get-Date) Остановка ВМ: $TS_name - Success"} 
+                catch {Add-Content -Path $($Settings.Logs.Delete_TS) -Value "$(Get-Date) Остановка ВМ: $TS_name - Failed"}
+
+                #удаление ВМ
+                try {Remove-VM -VM $TS_name -DeletePermanently -Confirm:$false -ErrorAction Stop; Add-Content -Path $($Settings.Logs.Delete_TS) -Value "$(Get-Date) Удаление ВМ: $TS_name - Success"} 
+                catch {Add-Content -Path $($Settings.Logs.Delete_TS) -Value "$(Get-Date) Удаление ВМ: $TS_name - Failed"}
+
+                #удаление терминального сервера из AD
+                $DN = (Get-ADComputer -Identity $TS_name).DistinguishedName
+                try {Remove-ADObject -Identity $DN -Recursive -Confirm:$false; Add-Content -Path $($Settings.Logs.Delete_TS) -Value "$(Get-Date) Удаление из AD: $TS_name - Success"} 
+                catch {Add-Content -Path $($Settings.Logs.Delete_TS) -Value "$(Get-Date) Удаление из AD: $TS_name - Failed"}
+
+                #удаление группы из AD
+                Remove-ADGroup -Identity $Group -Confirm:$false
+
+                #удаление A-записи из DNS
+                try {Remove-DnsServerResourceRecord -ComputerName $DC -ZoneName $DNS_zone -RRType "A" -Name $TS_name -Confirm:$false -Force; Add-Content -Path $($Settings.Logs.Delete_TS) -Value "$(Get-Date) Удаление DNS-записи - Success"} 
+                catch {Add-Content -Path $($Settings.Logs.Delete_TS) -Value "$(Get-Date) Удаление DNS-записи - Failed"}
+
+                #отправка письма на ИБ и ИТ
+                try {Send_Mail_Ticket -TS $TS_name -IP $IP_TS -ErrorAction Stop; Add-Content -Path $($Settings.Logs.Delete_TS) -Value "$(Get-Date) Отправка письма - Success"}
+                catch {Add-Content -Path $($Settings.Logs.Delete_TS) -Value "$(Get-Date) Отправка письма - Failed"} 
+            }
+        }
+}
+
+#логирование
+if (!$error) {Write-Host "В результате выполнения скрипта - ошибок не было"} else {Add-Content -Path $($Settings.Logs.Delete_TS) -Value "$(Get-Date) В результате выполнения скрипта были ошибки: $error"}
