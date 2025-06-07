@@ -1,0 +1,172 @@
+#мы хотим, чтобы скрипт отрабаывтвал только при наличии соединения с DC
+if (!(Test-ComputerSecureChannel)) {Write-Host "Connection to DC failed. Reconnect and retry."}
+else {
+
+##############################################
+#                                            #
+#  Блок 1. Установка RSAT .ActiveDirectory   #
+#                                            #
+##############################################
+
+#Проверяем, что компонент RSAT .ActiveDirectory установлен. Если не установлен - устанавливаем
+$folder = "\\Shared_Folder\Win10_FOD-PACKAGES"
+$status_AD=(Get-WindowsCapability -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0 -Online).state
+if ($status_AD -eq "NotPresent") {Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0 -LimitAccess -Source $folder}
+
+###############################
+#                             #
+#    Блок 2. Переменные       #
+#                             #
+###############################
+
+#кто легитимный локальный админ
+try { $check_local_admin_rights = (Get-ADComputer -Identity $(hostname) -Properties ManagedBy -ErrorAction Stop).ManagedBy} 
+#остановка выполнения скрипта, если не удалось определить
+catch {throw "Не удалось определить легетимного админа. Остановка скрипта"} 
+
+#определяем название группы доменных администраторов
+try { $domain_admins = (Get-ADGroup -filter * -ErrorAction Stop | Where-Object {$_.SID -like '*-512'}).name} 
+#остановка выполнения скрипта, если не удалось определить
+catch {throw "Не удалось определить группу Администраторов Домена. Остановка скрипта"} 
+
+#выясняем название учетки локального админа (у неё идентификатор заканчивается на 500)
+$build_admin = (Get-LocalUser | Where-Object {$_.SID -like '*500'}).name 
+
+#определяем название группы локальных администраторов
+$build_admin_group = (Get-LocalGroup | Where-Object {$_.SID -like '*544'}).name 
+
+#куда пишутся логи
+$error_logs = "\\Shared_Folder\logs_local_admin.txt" 
+
+#определяем доменный префикс
+$domain = (Get-ADDomain -Current LocalComputer).name
+
+####################################################################################################################
+#                                                                                                                  #
+#  Блок 3. Должен ли кто-то иметь права локального админа, если да - проверяем имеет ли, если не имеет - выдаем    #
+#                                                                                                                  #
+####################################################################################################################
+
+#проверяем должен ли кто-то иметь права локального админа на данном компе
+if ($check_local_admin_rights -eq $null) 
+
+    {$exit_legal = $null} #если никто не должен - значит можно завершать этот блок скрипта
+
+    else
+     
+    #если должен - продолжаем выполнение
+    {
+    #смотрим, кто именно должен иметь права админа
+    try { $legal_local_admin = (Get-ADUser -Filter * -Properties DistinguishedName -ErrorAction Stop | Where-Object {$_.DistinguishedName -like $check_local_admin_rights}).SamAccountName} 
+    #остановка выполнения скрипта, если не удалось определить
+    catch {throw "Не удалось определить легетимного админа. Остановка скрипта."} 
+    
+    #получаем список групп и пользователей, которые находятся в группе локальных администраторов
+    $all_local_admins = Get-LocalGroupMember -Group $build_admin_group | Where-Object {$_.PrincipalSource -EQ 'ActiveDirectory'}      
+        foreach($user in $all_local_admins)
+        {
+            #выбираем из массива только пользователей и проверяем каждого
+            if (($user.ObjectClass -eq "User") -or ($user.ObjectClass -eq "Пользователь")) 
+            {   
+                #проверяем, есть ли членов группы локальных админов - доменная учетная запись сотрудника
+                if ($user.Name -like "*$legal_local_admin") {$i+=1} 
+            }        
+        }
+    #если не имеет - выдаем, логируем это и оповещаем пользователя
+    if ($i -eq $null) {
+        try {
+            Add-LocalGroupMember -Group $build_admin_group -Member "$domain\$legal_local_admin" -ErrorAction Stop
+            $exit_legal = "Grant rights legitimate admin: $legal_local_admin"
+            msg * "Доменному пользователю [$legal_local_admin] делегированы права локального администратора на этом ПК. Перелогиньтесь, чтобы они вступили в действие"
+        }
+        catch {Write-Error "Ошибка при выдаче прав локального админа"}
+
+        #дефолтное запись этого блока, которая будет записана в лог, если кого-то не удалят
+        } else {$exit_legal = $null}
+    } 
+
+##########################################################
+#                                                        #
+#  Блок 4. Ищем лишних "админов". Если есть - удаляем    #
+#                                                        #
+##########################################################
+
+#получаем список групп и пользователей, которые находятся в группе локальных администраторов
+$all_local_admins = Get-LocalGroupMember -Group $build_admin_group 
+
+    foreach($user in $all_local_admins)
+        { 
+            #выбираем из массива ЛОКАЛЬНЫХ пользователей
+            if ((($user.ObjectClass -eq "User") -or ($user.ObjectClass -eq "Пользователь")) -and ($user.PrincipalSource -eq "Local"))  
+                { $delete_local_user = $user.Name.split('\')[1] #обрезаем доменный префикс
+
+                    #если ты учетка локального админа - тебя оставляем
+                    if ($build_admin -eq $delete_local_user) {Write-Host "Оставляем: $build_admin"}  
+                    
+                    #если ты кто-то иной - тебя удаляем из группы, логируем это и оповещаем пользователя
+                    else {
+                        try {
+                            
+                            Remove-LocalGroupMember -Group $build_admin_group -Member $delete_local_user -ErrorAction Stop 
+                            $exit_no_legal += " Deleted no-legitimate admin (local): $delete_local_user" 
+                            msg * "У локального пользователя [$delete_local_user] больше нет прав локального администратора на этом ПК"
+                            }
+                        catch {Write-Error "Ошибка при изъятии прав у локального пользователя"} 
+                         } 
+                }
+
+            #выбираем из массива ДОМЕННЫХ пользователей
+            if ((($user.ObjectClass -eq "User") -or ($user.ObjectClass -eq "Пользователь")) -and ($user.PrincipalSource -eq "ActiveDirectory")) 
+                { $delete_user = $user.Name.split('\')[1] #обрезаем доменный префикс
+
+                    #если ты легитимный сотрудник у которого должны быть права локального админа - тебя оставляем
+                    if ($legal_local_admin -eq $delete_user) {Write-Host "Оставляем: $legal_local_admin"} 
+                    
+                    #если ты кто-то иной - тебя удаляем из группы, логируем это и оповещаем пользователя
+                    else { 
+                        try {
+                            Remove-LocalGroupMember -Group $build_admin_group -Member "$domain\$delete_user" -ErrorAction Stop
+                            $exit_no_legal += " Deleted no-legitimate admin: $delete_user"
+                            msg * "У доменного пользователя [$delete_user] больше нет прав локального администратора на этом ПК"
+                            }
+                        catch {Write-Error "Ошибка при изъятии прав у доменного пользователя"}
+                         } 
+                }
+
+            #выбираем из массива ГРУППЫ БЕЗОПАСНОСТИ    
+            if (($user.ObjectClass -eq "Group") -or ($user.ObjectClass -eq "Группа")) 
+                { $delete_group = $user.Name.split('\')[1] #обрезаем доменный префикс
+
+                    #если ты группа Domain Admins - тебя оставляем
+                    if ($delete_group -eq $domain_admins) {Write-Host "Оставляем: $delete_group"} 
+                    
+                    #если ты кто-то иной - тебя удаляем из группы, логируем это и оповещаем пользователя
+                    else {
+                        try {
+                            Remove-LocalGroupMember -Group $build_admin_group -Member "$domain\$delete_group" -ErrorAction Stop
+                            $exit_no_legal += " Deleted no-legitimate group: $delete_group"
+                            msg * "Доменная группа [$delete_group] больше не имеет права локального администратора на этом ПК"
+                            }
+                        catch {Write-Error "Ошибка при изъятии прав у группы безопасности"}
+                        }      
+                }
+}
+
+#дефолтное запись этого блока, которая будет записана в лог, если кого-то не удалят
+if ($exit_no_legal -eq $null) {$exit_no_legal = $null} 
+
+##########################
+#                        #
+#  Блок 5. Логирование   #
+#                        #
+##########################
+
+#проверяем были ли выполнены какие-то сущностные действия
+if ( ($exit_legal -eq $null) -and ($exit_no_legal -eq $null) -and (!$error) ) {Write-Host "Писать лог не нужно"} else 
+{
+#собираем данные в одну переменную
+$export = "$(Get-Date) | $(hostname) | $exit_legal | $exit_no_legal | Error: $error "
+$export | Add-Content -Path $error_logs  #делаем запись в лог
+}
+
+}
