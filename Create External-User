@@ -1,0 +1,139 @@
+Clear
+
+#-----------------------------------------------#
+#                   ПЕРЕМЕННЫЕ                  #
+#-----------------------------------------------#
+
+#импорт данных из файла с настройками контура
+try {$Settings = Import-PowerShellDataFile "C:\Path\Settings.psd1" -ErrorAction Stop}
+catch {throw "Не удалось получения переменных из файла данных. Остановка скрипта"}
+
+$executor = (Get-ChildItem Env:USERNAME).Value #фиксация исполнителя
+
+$cred_mail = Get-Secret -Name 'Secret1' -Vault 'Vault1' #получаем логин\пароль от почтового ящика, с которого будет отправляться письмо
+
+$file_logs = $($Settings.Logs.Create_User) #путь до файла с логами
+
+$bcc = $($Settings.Mail.Infosec) #кто будет в скрытой копии писем
+
+$SmtpServer = $($Settings.Mail.SMTP_Server) #адрес почтового сервера
+
+$Attachment = $($Settings.Mail.Attachment) #путь до файла с инструкцией, которая будет выслана подрядчикам
+
+$ConnectionUri = $($Settings.Mail.ConnectionUri) #URL для подключения к Exchange
+
+#-----------------------------------------------#
+#               НАЧАЛО ПРОЦЕССА                 #
+#-----------------------------------------------#
+
+#вызов формы для ввода данных через кастомный модуль 
+$date = GUI_External_User
+
+#транслитерация ФИО в login через функцию Translit, в кастомный модуль
+
+$split_name = $($date[0]) -split " " #разделяем строку с полным ФИО на отдельные слова (Фамилия, Имя, Отчество)
+$first_name = $split_name[0] #записываем в $first_name значение первой строки после разделения (фамилию)
+$last_name = $split_name[1] #записываем в $last_name значение второй строки после разделения (имя)
+$translit_first_name = Translit -string $first_name #обращение к функции транслитерации 
+$translit_last_name = Translit -string $last_name ##обращение к функции транслитерации 
+$login="$translit_last_name.$translit_first_name" #получение логина для учетной записи
+
+#проверка на длину логина
+if (($login.Length) -gt 20) {$login = $login.Remove(20); Write-Host "Логин получился больше 20 символов, поэтому был обрезан: $login" -foregroundcolor Yellow}
+
+#проверка, что учетной записи с получившемся логином не существует
+if (@(Get-ADUser -Filter "SamAccountName -eq '$login'").Count -ne 0) 
+
+#что делаем, если УЗ существует
+{Write-Host "Учетная запись $login есть - обрезаем 1 символ" -foregroundcolor Yellow
+$coint_symbol = ($login.Length -1) 
+$login = $login.Remove($coint_symbol) 
+Write-Host "Логин был обрезан на 1 символ: $login" -foregroundcolor Yellow}
+else {Write-Host "Учетной записи $login не существует - начинаем создание" -foregroundcolor Yellow} #что делаем, если УЗ НЕ существует
+
+#генерация случайного пароля для УЗ
+Add-Type -AssemblyName System.Web
+$pass = [System.Web.Security.Membership]::GeneratePassword(12,3)
+
+#формирование строки описания в AD
+$description = "Создана по заявке: $($date[8]), исполнитель: $executor"
+
+#---------------------------------------------------#
+#                    СОЗДАНИЕ УЗ                    #
+#---------------------------------------------------#
+
+#фиксируем данные, из которых будут создаваться аттрибуты учетной записи
+    $splat = @{
+    Name = $($date[0])
+    AccountPassword = (ConvertTo-SecureString $pass -AsPlainText -force)
+    Path = $($date[7])
+    Enabled = $true
+    GivenName = $first_name
+    Company = $($date[1])
+    SamAccountName = $login
+    DisplayName = $($date[0])
+    UserPrincipalName = ($login + "@omnichannel.ru")
+    title = $($date[2])
+    manager = $($date[5])
+    description = $description
+    AccountExpirationDate = $($date[4])
+    ChangePasswordAtLogon = $true
+    Surname = $last_name
+    }
+
+try {New-ADUser @splat -ErrorAction Stop; Add-Content -Path $file_logs -Value "$(Get-Date) | Создана учетная запись: $login"} 
+catch {Add-Content -Path $file_logs -Value "$(Get-Date) | Не удалось создать учетную запись: $login"; throw "Не удалось создать учетную запись: $login. Остановка скрипта"}
+
+#добавление в группы безопасности AD
+Add-AdGroupMember -Identity 'group_name' -Members $login
+foreach($add_group in $($date[6])){Add-AdGroupMember -Identity $add_group -Members $login}
+#фиксируем адрес терминального сервера, на который согласован доступ
+if ($date[9] -eq $null) {Write-Host "Доступ на терминальный сервер - не согласован" -foregroundcolor Yellow} else {Add-AdGroupMember -Identity $($date[9]) -Members $login}
+
+#---------------------------------------------------#
+#                 ОТПРАВКА EMAIL                    #
+#---------------------------------------------------#
+
+#формирование текста письма для отправки
+$livetime = $date[4]
+$manager_email = (Get-ADUser -Identity $($date[5]) -Properties mail).mail
+
+#фиксируем адрес терминального сервера, на который согласован доступ
+$TS_hostname = (Get-ADGroup -Identity $($date[9]) -Properties Description).Description
+$TS_IP = (Get-ADComputer -identity $TS_hostname -Properties extensionAttribute15).extensionAttribute15
+
+
+$body_mail = @"
+<p style="margin-left:0cm; margin-right:0cm"><span style="font-size:16px"><span style="font-family:Times New Roman,Times,serif">Добрый день!<br />
+Для вас была создана учетная запись в домене компании AAA:</span></span></p>
+<table border="1" cellpadding="1" cellspacing="1" style="width:0px">
+	<tbody>
+		<tr>
+			<td><span style="font-size:16px"><span style="font-family:Times New Roman,Times,serif">Логин: </span></span></td>
+			<td><span style="font-size:16px"><span style="font-family:Times New Roman,Times,serif">$login</span></span></td>
+		</tr>
+		<tr>
+			<td><span style="font-size:16px"><span style="font-family:Times New Roman,Times,serif">Пароль: </span></span></td>
+			<td><span style="font-size:16px"><span style="font-family:Times New Roman,Times,serif">$pass</span></span></td>
+		</tr>
+	</tbody>
+</table>
+<p style="margin-left:0cm; margin-right:0cm"><span style="font-size:16px"><span style="font-family:Times New Roman,Times,serif">Дополнительная информация:</span></span></p>
+<ul>
+	<li><span style="font-size:16px"><span style="font-family:Times New Roman,Times,serif">Ваша учетная запись включена до: <strong>$livetime</strong>. Продление срока жизни, при необходимости - можно запросить через вашего менеджера: <strong>$($date[5])</strong></span></span></li>
+	<li><span style="font-size:16px"><span style="font-family:Times New Roman,Times,serif">IP-адрес Терминального сервера для подключения: <strong>$IP_TS</strong></span></span></li>
+	<li><span style="font-size:16px"><span style="font-family:Times New Roman,Times,serif">Постоянный пароль нужно будет сменить <strong>через 6 месяцев</strong> (будет дополнительное уведомление на почту @domain.ru)</span></span></li>
+	<li><span style="font-size:16px"><span style="font-family:Times New Roman,Times,serif">Инструкция для первого входа - <strong>во вложении</strong> к этому письму</span></span></li>
+</ul>
+<p><span style="font-size:16px"><span style="font-family:Times New Roman,Times,serif">Если что-то не получится - пишите нам ответное письмо, с обязательным сохранением текста переписки</span></span></p>
+"@
+
+#отправка письма, если в процессе выполнения скрипта не было ошибок и очищение всех переменных для повторного запуска скрипта
+if (!$error) {
+Send-MailMessage -From 'helpdesk@bpmsoft.ru' -To $($date[3]) -Bcc $bcc -Cc $manager_email -Subject "Учетная запись BPMSoft" -Body $body_mail -Attachment $Attachment –SmtpServer $SmtpServer -Encoding 'UTF8' -Port 587 –UseSsl -Credential $cred_mail -BodyAsHtml
+
+#очищение переменных для повторного запуска скрипта
+Remove-Variable * -ErrorAction SilentlyContinue
+$Error.Clear()
+}
+
