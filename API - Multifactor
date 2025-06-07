@@ -1,0 +1,95 @@
+#переменные
+$log_file = "Path\logs.txt" #путь в файла, в который будут писаться логи
+$search_OU = "OU=Empl,DC=domain,DC=ru" #в какой OU искать отключенные учетные записи
+$cred_mail = Get-Secret -Name 'Secret1' -Vault 'Vault1' #получаем логин\пароль от почтового ящика, с которого будет отправлять уведомление
+$To = 'Ivan.Ivanov@domain.ru' #кто получает уведомление
+$SmtpServer = 'mail.domain.ru' #адрес почтового сервера
+
+#получение API Key и API Secret из KeePass в зашифрованном виде для подключения к Multifactor
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$SecureApiKey = Get-Secret -Name 'API_Key1' -Vault 'Vault1'
+$SecuryApiSecret = Get-Secret -Name 'API_Secret1' -Vault 'Vault1'
+
+#преобразование SecureString в обычный текст, т.к. API требует обычную строку (PlainText) 
+$apiKey = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+    [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureApiKey))
+
+$apiSecret = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+    [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecuryApiSecret))
+
+$encodedCredentials = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(("{0}:{1}" -f $apiKey, $apiSecret)))
+
+#получение списка всех УЗ, которые сейчас имеют лицензию
+$parameters = @{
+    Uri         = 'https://api.multifactor.ru/users'
+    Headers     = @{ 'Authorization' = "Basic $encodedCredentials" }
+    Method      = 'GET'
+    ContentType = 'application/json; charset=utf-8'
+}
+
+$users_with_licenses=@();
+$users_with_licenses=(Invoke-RestMethod @parameters | Select-Object -Expand model).identity
+
+#создание массива, в который будут добавляться УЗ подходящие для удаления из Multifactor
+$remove_license=@()
+
+#проверка каждой УЗ на 2 критерия для отбора лицензии: отключена \ не существует
+foreach($user in $users_with_licenses)
+{
+$check_enable=(Get-ADUser -Filter {SamAccountName -eq $user} -SearchBase $search_OU).Enabled
+$check_exist=@(Get-ADUser -Filter {SamAccountName -eq $user}).Count
+if (($check_enable -eq $False) -or ($check_exist -eq 0)) {'УЗ отключена или не существует: '+$user; $remove_license+=$user}
+}
+
+#запись в лог списка УЗ на удаление, если они есть и начало удаления
+if (@($remove_license).count -eq 0) {Add-Content -Path $log_file -Value "$(Get-Date) Нет учетных записей, которые нужно удалить"} 
+else 
+  {
+    #если есть что удалять - продолжаем
+    Add-Content -Path $log_file -Value "$(Get-Date) Учетные записи, которые будут удалены из Multifactor: $remove_license"
+    
+    #объявляем массив, в который будут добавляться ID учеток для удаления из Multifactor
+    $remove_id=@()
+
+    #получение списка id учеток, у которых нужно забрать лицензии
+    foreach($user_multifactor in $remove_license)
+    {
+    $parameters = @{
+        Uri         = "https://api.multifactor.ru/users?identity=$user_multifactor"
+        Headers     = @{ 'Authorization' = "Basic $encodedCredentials" }
+        Method      = 'GET'
+        ContentType = 'application/json; charset=utf-8'
+    }
+    $remove_id+=(Invoke-RestMethod @parameters | Select-Object -Expand model).id
+    }
+
+    #удаление учеток из Multifactor по списку ID
+    foreach($id in $remove_id)
+    {
+    $parameters = @{
+        Uri         = "https://api.multifactor.ru/users/$id"
+        Headers     = @{ 'Authorization' = "Basic $encodedCredentials" }
+        Method      = 'DELETE'
+        ContentType = 'application/json; charset=utf-8'}
+
+    Add-Content -Path $log_file -Value "$(Get-Date) учетная запись с id $id удалена из мультифактора"
+    Invoke-RestMethod @parameters | Add-Content -Path $log_file;
+    }
+
+  }
+
+#проверка количества лицензий и оповещение, если осталось меньше 5
+$parameters = @{
+    Uri         = 'https://api.multifactor.ru/users/count'
+    Headers     = @{ 'Authorization' = "Basic $encodedCredentials" }
+    Method      = 'GET'
+    ContentType = 'application/json; charset=utf-8'
+}
+
+$lisence=Invoke-RestMethod @parameters | Select-Object -Expand model
+
+if (($lisence.limit - $lisence.total) -gt 5) {"Лицензий больше 5"} else 
+{Send-MailMessage -From 'mailbox@domain.ru' -To $To -Subject "Заканчиваются лицензии Multifactor" -Body "$lisence"  –SmtpServer $SmtpServer -Encoding 'UTF8' -Port 587 –UseSsl -Credential $cred_mail}
+
+#запись в лог ошибок:
+Add-Content -Path $log_file -Value "$(Get-Date) Во время выполнения скрипта были следюущие системные ошибки: `r`n $Error"
