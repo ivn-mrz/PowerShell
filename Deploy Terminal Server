@@ -1,0 +1,167 @@
+Clear
+
+#-----------------------------------------------------#
+#---------------------ПЕРЕМЕННЫЕ----------------------#
+#-----------------------------------------------------#
+
+#импорт данных из файла с настройками контура
+try {$Settings = Import-PowerShellDataFile "C:\Path\Settings1.psd1" -ErrorAction Stop}
+catch {throw "Не удалось получения переменных из файла данных. Остановка скрипта"}
+
+$cred_local = Get-Secret -Name 'Secret2' -Vault 'Vault2' 
+
+#AD
+$OU = $($Settings.OU.TS) #OU куда будет отправлен терминальник
+$OU_access_group = $($Settings.OU.RDP_Groups) #OU, где будет лежать группа доступа к терминальнику
+
+#vSphere
+$vSphere_Folder = $($Settings.vSphere.Folder) #папка в сфере, куда будет помещена ВМ 
+$vSphere_datastore = $($Settings.vSphere.Datastore)
+$vSphere_host = $($Settings.vSphere.Host)
+$vSphere_URL = $($Settings.vSphere.URL_Connect)
+$template = $($Settings.vSphere.Template)
+$network_adapter = $($Settings.vSphere.Network_Adapter)
+
+#network
+$DNS_Server = $($Settings.vSphere.DNS_Servers)
+$Gateway = $($Settings.vSphere.Network_Gateway)
+
+Write-Host "Подключаемся к $vSphere_URL" -foregroundcolor Yellow
+try {Connect-VIServer $vSphere_URL -ErrorAction Stop} catch {throw "Не удалось подключиться к vSphere. Остановка скрипта"}
+
+#-----------------------------------------------------#
+#----------ФОРМИРОВАНИЕ ПЕРВОНАЧАЛЬНЫХ ДАННЫХ---------#
+#-----------------------------------------------------#
+
+$company = read-host -Prompt "Введите название компании, для которой разворачивается Терминальный Сервер"
+$cred_domain = Get-Credential -Message "Введите данные своей Админской УЗ. `r`nЛОГИН вводить ОБЯЗАТЕЛЬНО с доменным ПРЕФИКСОМ (иначе ВМ не заведется в домен)`r`n"
+$hostname = "hostname-$company"
+if (($hostname.Length) -gt 15) {$hostname = $hostname.Remove(15); Write-Host "Хостнейм машины получился больше 15 символов, поэтому был обрезан: $hostname" -foregroundcolor Yellow} 
+else {Write-Host "Хостнейм машины: $hostname" -foregroundcolor Yellow}
+$access_group = "RDP-$hostname"; Write-Host "Доступ к терминальном серверу будет даваться через группу: $access_group" -foregroundcolor Yellow
+New-ADGroup -Name $access_group -SamAccountName $access_group -GroupCategory Security -GroupScope Global -DisplayName $access_group -Path $OU_access_group -Description "$hostname"
+
+#ввод IP-адреса
+$ip_address=read-host -Prompt "Введите свободный IP-адрес из сети 10.10.10.0 для Терминального сервера"
+
+#дополнительная проверка средствами гипервизора, что IP-адрес ещё не выдан
+$check = (Get-VMHost -name $vSphere_host | Get-VM * | where-object {$_.Guest.IPAddress -match $ip_address}).name
+if ($check -eq $null) {Write-Host "Будет назначен IP: $ip_address"-ForegroundColor Yellow} else {
+Write-Host "Должен быть назначен IP: $ip_address, но его уже имеет VM: $check. Разбирайтесь почему!" -ForegroundColor Red
+throw "Остановка скрипта"
+}
+
+
+#-----------------------------------------------------#
+#---------------------СОЗДАНИЕ ВМ---------------------#
+#-----------------------------------------------------#
+
+Write-Host "Виртуальная машина создается..." -foregroundcolor Yellow
+try {New-VM -Template $template -Name $hostname -VMHost $vSphere_host -Datastore $vSphere_datastore -Location $vSphere_Folder -ErrorAction Stop}
+catch {throw "Не удалось создать VM. Остановка скрипта"}
+
+#-----------------------------------------------------#
+#------------ЗАПУСК ВМ И ОПРЕДЕЛЕНИЕ IP-АДРЕСА--------#
+#-----------------------------------------------------#
+try {Start-VM -VM $hostname -ErrorAction Stop; Write-Host "Виртуальная машина $hostname запущена" -foregroundcolor Yellow} 
+catch {throw "Не удалось запустить VM. Остановка скрипта"}
+
+Write-Host "Ожидаем пока VMware Tools передадут гипервизору IP-адрес..." -foregroundcolor Yellow
+DO
+{
+$ipbuf=(Get-VM $hostname).Guest.IPAddress
+$ipvm=$ipbuf[0]
+}
+Until ($ipvm -ne $null)
+Write-Host "IP-адрес определен: $ipvm" -foregroundcolor Yellow
+
+#-----------------------------------------------------#
+#--------------------ВВОД В ДОМЕН---------------------#
+#-----------------------------------------------------#
+
+Write-Host "Ожидаем запуск службы WinRM для отправки удаленных команд" -foregroundcolor Yellow
+
+DO
+{$WS_online = [bool](Test-WSMan $ipvm -ErrorAction SilentlyContinue)}
+Until ($WS_online -contains "True")
+Write-Host "Служба WinRM на стенде запустилась! Начинаем ввод в домен..." -foregroundcolor Yellow
+
+#подключаемся к сессии новой машины
+try {Invoke-Command -ComputerName $ipvm -Credential $cred_local -ScriptBlock {param($param1, $param2)Add-Computer -DomainName domain.ru -Credential $param2 -newname $param1 -force -verbose; Start-Sleep -Seconds 5; Restart-Computer -Force} -ArgumentList $hostname, $cred_domain -ErrorAction Stop}
+catch {throw "Не удалось завести машину в домен. Остановка скрипта"}
+
+Write-Host "Проверяем сетевую доступность ВМ... Это может занять несколько минут, пока новое имя не начнет резолвиться" -foregroundcolor Yellow
+ 
+#проверяем резолв ВМ, заведенной в домен
+DO
+{
+$Ping = Test-Connection $hostname -Quiet}
+Until ($Ping -contains "True")
+Write-Host "ВМ в сети`r`n" -foregroundcolor Yellow
+
+#-----------------------------------------------------#
+#---------------------НАСТРОЙКА ОС--------------------#
+#-----------------------------------------------------#
+Write-Host "Ожидаем запуск службы WinRM для отправки удаленных команд" -foregroundcolor Yellow
+
+DO
+{$WS_online_domain = [bool](Test-WSMan $hostname -ErrorAction SilentlyContinue)}
+Until ($WS_online_domain -contains "True")
+Write-Host "Служба WinRM на стенде запустилась после ввода в домен! Начинаем настройку ОС..." -foregroundcolor Yellow
+
+#перемещение компа в AD и запись IP  атрибут
+try {Get-ADComputer -Identity $hostname | Move-ADObject -TargetPath $OU -ErrorAction Stop; Write-Host "Компьютер $hostname перемещен в $OU" -foregroundcolor Yellow}
+catch {Write-Host "Не удалось переместить компьютер $hostname в $OU" -foregroundcolor Yellow}
+Set-ADComputer $hostname -Replace @{'extensionAttribute15' = $ip_address}
+
+#назначение прав для подключения по RDP
+try {Invoke-Command -ComputerName $hostname -Credential $cred_domain -ScriptBlock {param($group) Add-LocalGroupMember -Group "Remote Desktop Users" -Member $group} -ArgumentList $access_group -ErrorAction Stop
+Write-Host "Доступ к TS для группы $access_group настроен" -foregroundcolor Yellow}
+catch {Write-Host "Доступ к TS для группы $access_group не удалось настроить" -foregroundcolor Yellow}
+
+#получение лицензии на KMS-сервере
+Write-Host "Получение лицензии на KMS-сервере" -foregroundcolor Yellow
+Invoke-Command -ComputerName $hostname -Credential $cred_domain -ScriptBlock {slmgr /ipk VDYBN-27WPP-V4HQT-9VMD4-VMK7H; slmgr /skms you_kms_server:1688; slmgr /ato}
+
+#настройка статического IP-адреса на сетевуху и перемещение его в закрытую сеть
+#ОТПРАВЛЯТЬ НУЖНО С КРЕДЛАМИ УЧЕТКИ, У КОТОРОЙ УЖЕ СОЗДАН ПРОФИЛЬ - ВСТРОЕННОГО АДМИНА
+Write-Host "Назначение статического IP-адреса" -foregroundcolor Yellow
+Get-NetworkAdapter -VM $hostname | Set-NetworkAdapter -NetworkName $network_adapter -Confirm:$false
+$ScriptText = "New-NetIPAddress -InterfaceAlias 'Ethernet0' -AddressFamily Ipv4 -IPAddress $ip_address -PrefixLength 21 -DefaultGateway $Gateway"
+$ScriptText2 = "Disable-NetAdapterBinding -InterfaceAlias 'Ethernet0' -ComponentID ms_tcpip6"
+$ScriptText3 = "Set-DNSClientServerAddress -InterfaceAlias 'Ethernet0' –ServerAddresses $DNS_Server"
+Invoke-VMScript -ScriptText $ScriptText -VM $hostname -GuestCredential $cred_local
+Invoke-VMScript -ScriptText $ScriptText2 -VM $hostname -GuestCredential $cred_local
+Invoke-VMScript -ScriptText $ScriptText3 -VM $hostname -GuestCredential $cred_local
+
+#-----------------------------------------------------#
+#--------------АППАРАТНЫЕ ХАРАКТЕРИСТИКИ ВМ-----------#
+#-----------------------------------------------------#
+Write-Host "По умолчанию, VM имеет следующие характеристики: 4 ЦПУ, 8 ГБ памяти, 50 ГБ диск. Нужно ли изменить эти значения?" -foregroundcolor Yellow
+
+$change_hardware=read-host -Prompt "1. Оставить значения по умолчанию`r`n2. Изменить количество ресурсов`r`n"
+switch ($change_hardware)
+    {
+    '1' {Write-Host "Аппаратные характеристики останутся по умолчанию" -foregroundcolor Yellow}
+    '2' {
+        $cpu_size=read-host -Prompt "Укажите количество ядер (шт). Нельзя указать меньше, чем есть уже!"
+        $memory_size=read-host -Prompt "Укажите объем памяти (ГБ). Нельзя указать меньше, чем есть уже!"
+        $disk_size =read-host -Prompt "Укажите размер диска (ГБ). Нельзя указать меньше, чем есть уже!"
+        Set-VM -VM $hostname -NumCpu $cpu_size -Confirm: $False #работает только когда VM включена!
+        Set-VM -VM $hostname -MemoryGB $memory_size -Confirm: $False
+        Get-HardDisk -VM $hostname | Set-HardDisk -CapacityGB $disk_size -Confirm: $False
+
+        #расширение диска
+        Write-Host "Расширяем диск со стороны ОС" -foregroundcolor Yellow
+        Invoke-VMScript -ScriptText '$size = (Get-PartitionSupportedSize -DriveLetter "C");  Resize-Partition -DriveLetter "C" -Size $size.SizeMax' -VM $hostname -GuestCredential $cred_local
+Add commentMore actions
+        }
+    }
+
+#Перезагрузка ВМ
+Write-Host "Отправляем ВМ в перезагрузку..." -foregroundcolor Yellow
+#игнорирование ошибки, потому что при перезагрузки он всегда отдает ошибку, но фактически - машина уходит в ребут
+Invoke-VMScript -ScriptText 'Restart-Computer -Confirm: $False -Force' -VM $hostname -GuestCredential $cred_local -ErrorAction Ignore
+
+#очищение всех переменных для повторного запуска скрипта
+if (!$error) {Remove-Variable * -ErrorAction SilentlyContinue; $Error.Clear()}
